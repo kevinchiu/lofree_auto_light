@@ -1,0 +1,6 @@
+{
+  "schedule": [
+    { "time": "07:00", "level": "off" },
+    { "time": "17:00", "level": 4 }
+  ]
+}
