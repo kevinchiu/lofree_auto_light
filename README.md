@@ -5,6 +5,14 @@ is open. When the lid is closed, it uses a time-of-day schedule instead.
 Tested with the Flow Lite84 (`Air84@Lofree`, USB ID `05ac:024f`, firmware v1.64) over USB, on a
 MacBook Pro (M1 Max).
 
+> **Not affiliated with Lofree.** This is an unofficial tool built from a reading of Lofree's
+> public web configurator. It writes to your keyboard's stored settings and can't read them back
+> to check. It has only been tested on the keyboard above. Use it at your own risk. Lofree's
+> configurator at https://www.lofree.tech/keyboard/ can restore defaults if something goes wrong.
+>
+> It only writes to USB devices with "Lofree" in their name and with one of the wired-keyboard
+> IDs Lofree's configurator lists.
+
 ## Install
 
 ```sh
@@ -93,3 +101,7 @@ this keyboard came with). If you pick a different lighting effect with the Fn ke
 level change switches it back.
 
 Over Bluetooth or the 2.4 GHz dongle the tool does nothing. Only a USB connection is supported.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

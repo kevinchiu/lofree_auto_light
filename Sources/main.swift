@@ -36,7 +36,13 @@ func registryProperty(_ entry: io_registry_entry_t, _ key: String) -> Any? {
 final class Keyboard {
     static let reportID: UInt8 = 8
     static let vendorUsagePage = 0xFF02
-    static let lofreeVendorIDs: Set<Int> = [0x3554, 0x388D]
+    // USB IDs that Lofree's web configurator lists for its wired keyboards (its 2.4 GHz dongle ID 0xFA0A is
+    // left out, untested). The IDs aren't unique to Lofree: 0x05AC is Apple's, and 0x3554 is shared with other
+    // products on the same chip family, Lofree's own mice included (different product IDs, different memory
+    // map). Writing keyboard addresses to one of those could corrupt its settings, so a device must match a
+    // listed vendor ID, a listed keyboard product ID, and say "Lofree" in its name.
+    static let keyboardVendorIDs: Set<Int> = [0x05AC, 0x3554, 0x388D]
+    static let keyboardProductIDs: Set<Int> = [0x024F, 0xF811, 0x0008, 0x0009, 0x0011, 0x0012, 0x0014, 0x0015]
 
     private let device: IOUSBHostDevice
     private let interfaceNumber: UInt16
@@ -76,7 +82,8 @@ final class Keyboard {
         while case let dev = IOIteratorNext(devices), dev != 0 {
             let name = registryProperty(dev, "USB Product Name") as? String ?? ""
             let vid = registryProperty(dev, "idVendor") as? Int ?? 0
-            if name.localizedCaseInsensitiveContains("lofree") || lofreeVendorIDs.contains(vid),
+            let pid = registryProperty(dev, "idProduct") as? Int ?? 0
+            if name.localizedCaseInsensitiveContains("lofree"), keyboardVendorIDs.contains(vid), keyboardProductIDs.contains(pid),
                let iface = vendorInterface(of: dev) {
                 return (dev, iface)
             }
