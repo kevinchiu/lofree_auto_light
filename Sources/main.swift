@@ -1,4 +1,5 @@
-// lofree-light: set a Lofree keyboard's backlight brightness from a time-of-day schedule.
+// lofree-light: drive a Lofree keyboard's backlight from the MacBook's built-in keyboard backlight
+// (lid open) or from a time-of-day schedule (lid closed).
 //
 // Protocol (reverse-engineered from Lofree's own web configurator, https://www.lofree.tech/keyboard/):
 //   - The keyboard has a vendor HID collection (usage page 0xFF02) that takes 16-byte output reports with report ID 8:
@@ -14,6 +15,8 @@
 // USB interface also carries keystrokes. A USB control transfer needs no permission, but it is write-only:
 // the keyboard's replies arrive on the interrupt endpoint owned by the HID driver, and the firmware answers
 // GET_REPORT with zeros. So this tool cannot read the keyboard's current settings; it only writes them.
+//
+// Built-in backlight: read through CoreBrightness's private KeyboardBrightnessClient, which needs no permission.
 
 import Foundation
 import IOKit
@@ -22,6 +25,10 @@ import IOUSBHost
 struct LofreeError: Error, CustomStringConvertible {
     let description: String
     init(_ d: String) { description = d }
+}
+
+func registryProperty(_ entry: io_registry_entry_t, _ key: String) -> Any? {
+    IORegistryEntryCreateCFProperty(entry, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue()
 }
 
 // MARK: - USB transport
@@ -33,6 +40,12 @@ final class Keyboard {
 
     private let device: IOUSBHostDevice
     private let interfaceNumber: UInt16
+
+    static var isConnected: Bool {
+        guard let (service, _) = findService() else { return false }
+        IOObjectRelease(service)
+        return true
+    }
 
     /// Opens the first USB-attached Lofree keyboard. Returns nil when none is attached.
     static func open() throws -> Keyboard? {
@@ -53,10 +66,6 @@ final class Keyboard {
 
     deinit { device.destroy() }
 
-    private static func property(_ entry: io_registry_entry_t, _ key: String) -> Any? {
-        IORegistryEntryCreateCFProperty(entry, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue()
-    }
-
     /// Finds a Lofree USB device and the number of its interface that carries the vendor collection.
     private static func findService() -> (io_service_t, UInt16)? {
         var devices: io_iterator_t = 0
@@ -65,8 +74,8 @@ final class Keyboard {
         defer { IOObjectRelease(devices) }
 
         while case let dev = IOIteratorNext(devices), dev != 0 {
-            let name = property(dev, "USB Product Name") as? String ?? ""
-            let vid = property(dev, "idVendor") as? Int ?? 0
+            let name = registryProperty(dev, "USB Product Name") as? String ?? ""
+            let vid = registryProperty(dev, "idVendor") as? Int ?? 0
             if name.localizedCaseInsensitiveContains("lofree") || lofreeVendorIDs.contains(vid),
                let iface = vendorInterface(of: dev) {
                 return (dev, iface)
@@ -83,7 +92,7 @@ final class Keyboard {
 
         while case let child = IOIteratorNext(children), child != 0 {
             defer { IOObjectRelease(child) }
-            guard let number = property(child, "bInterfaceNumber") as? Int else { continue }
+            guard let number = registryProperty(child, "bInterfaceNumber") as? Int else { continue }
             let pairs = IORegistryEntrySearchCFProperty(child, kIOServicePlane, "DeviceUsagePairs" as CFString,
                                                         kCFAllocatorDefault, IOOptionBits(kIORegistryIterateRecursively))
             if let pairs = pairs as? [[String: Any]],
@@ -130,7 +139,7 @@ final class Keyboard {
     }
 }
 
-// MARK: - Backlight model
+// MARK: - Lofree backlight
 
 enum Level: Equatable, CustomStringConvertible, Decodable {
     case off
@@ -162,25 +171,93 @@ struct Backlight {
     static let modeAddr = 0x2130, stateAddr = 0x2132, effectBase = 0x2160
 
     // Brightness is stored per light mode, and the current mode can't be read back over this transport,
-    // so the schedule pins the keyboard to one mode. These are the values this keyboard was set to
+    // so brightness changes pin the keyboard to one mode. These are the values this keyboard was set to
     // (mode 0, color index 0, speed 2).
     static let mode = 0, colorIndex: UInt8 = 0, speed: UInt8 = 2
 
     let kb: Keyboard
 
-    func apply(_ level: Level) throws {
+    /// Writes `level`. `previous` is what this process last wrote, if anything; it lets brightness-only
+    /// changes skip the mode and on/off writes, to keep wear on the keyboard's flash down.
+    func apply(_ level: Level, previous: Level? = nil) throws {
         switch level {
         case .off:
             try kb.write(Backlight.stateAddr, [0, 0x55])
         case .brightness(let n):
-            let m = UInt8(Backlight.mode)
+            var wasOn = false
+            if case .brightness? = previous { wasOn = true }
+            if !wasOn {
+                let m = UInt8(Backlight.mode)
+                try kb.write(Backlight.modeAddr, [m, 0x55 &- m])
+            }
             var effect = [Backlight.colorIndex, Backlight.speed, UInt8(n)]
             effect.append(UInt8(truncatingIfNeeded: 0x55 - effect.reduce(0) { $0 + Int($1) }))
-            try kb.write(Backlight.modeAddr, [m, 0x55 &- m])
             try kb.write(Backlight.effectBase + Backlight.mode * 32, effect)
-            try kb.write(Backlight.stateAddr, [1, 0x54])
+            if !wasOn {
+                try kb.write(Backlight.stateAddr, [1, 0x54])
+            }
         }
     }
+}
+
+// MARK: - MacBook built-in keyboard backlight
+
+@objc private protocol KeyboardBrightnessClient {
+    func copyKeyboardBacklightIDs() -> NSArray?
+    func isKeyboardBuiltIn(_ keyboardID: UInt64) -> Bool
+    func brightness(forKeyboard keyboardID: UInt64) -> Float
+    func isBacklightDimmed(onKeyboard keyboardID: UInt64) -> Bool
+    func isBacklightSuppressed(onKeyboard keyboardID: UInt64) -> Bool
+    func isAutoBrightnessEnabled(forKeyboard keyboardID: UInt64) -> Bool
+}
+
+final class BuiltInBacklight {
+    struct Reading {
+        var brightness: Float   // the slider value, 0-1 (set by you, or by auto-brightness)
+        var idleDimmed: Bool    // turned off after a few seconds without input; not a brightness choice
+        var autoBrightness: Bool
+    }
+
+    private let object: NSObject
+    private let keyboardID: UInt64
+    private var client: KeyboardBrightnessClient { unsafeBitCast(object, to: KeyboardBrightnessClient.self) }
+
+    /// nil when this Mac has no built-in backlit keyboard or CoreBrightness has changed shape.
+    init?() {
+        guard dlopen("/System/Library/PrivateFrameworks/CoreBrightness.framework/CoreBrightness", RTLD_NOW) != nil,
+              let cls = NSClassFromString("KeyboardBrightnessClient") as? NSObject.Type else { return nil }
+        let object = cls.init()
+        let selectors = ["copyKeyboardBacklightIDs", "isKeyboardBuiltIn:", "brightnessForKeyboard:",
+                         "isBacklightDimmedOnKeyboard:", "isBacklightSuppressedOnKeyboard:", "isAutoBrightnessEnabledForKeyboard:"]
+        guard selectors.allSatisfy({ object.responds(to: NSSelectorFromString($0)) }) else { return nil }
+        let client = unsafeBitCast(object, to: KeyboardBrightnessClient.self)
+        guard let ids = client.copyKeyboardBacklightIDs() as? [NSNumber],
+              let id = ids.map(\.uint64Value).first(where: { client.isKeyboardBuiltIn($0) }) else { return nil }
+        self.object = object
+        self.keyboardID = id
+    }
+
+    func read() -> Reading {
+        let c = client
+        let dimmed = c.isBacklightDimmed(onKeyboard: keyboardID)
+        return Reading(brightness: c.brightness(forKeyboard: keyboardID), idleDimmed: dimmed,
+                       autoBrightness: c.isAutoBrightnessEnabled(forKeyboard: keyboardID))
+    }
+
+    /// Maps the 0-1 slider onto off + Lofree levels 0-4 (five equal bands). Sticks with `current` until the
+    /// value is clearly past that band's edge, so auto-brightness jitter at a boundary doesn't cause flapping.
+    static func level(for brightness: Float, current: Level?) -> Level {
+        guard brightness > 0.001 else { return .off }
+        let x = Double(brightness) * 5
+        if case .brightness(let c)? = current, x > Double(c) - 0.15, x < Double(c + 1) + 0.15 { return .brightness(c) }
+        return .brightness(min(Level.range.upperBound, Int(x)))
+    }
+}
+
+func lidClosed() -> Bool {
+    let root = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+    defer { IOObjectRelease(root) }
+    return registryProperty(root, "AppleClamshellState") as? Bool ?? false
 }
 
 // MARK: - Schedule
@@ -232,64 +309,144 @@ struct Schedule: Decodable {
     }
 }
 
-// Remembers which schedule slot was last applied, so manual Fn-key changes are left alone until the next slot.
-enum AppliedSlot {
-    static var url: URL {
-        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/state/lofree-light/last-applied")
-    }
-    static func key(_ entry: Schedule.Entry, _ since: Date) -> String {
+// MARK: - Deciding what the Lofree should show
+
+struct Target: Equatable {
+    var level: Level
+    var key: String     // a new key means "apply now"; an unchanged key leaves manual Fn-key changes alone
+    var reason: String
+}
+
+final class Controller {
+    let builtIn = BuiltInBacklight()
+    private var followed: Level?
+    private var schedule: Schedule?
+    private(set) var scheduleError: String?
+
+    /// What the Lofree should show right now, or nil to leave it as it is.
+    func target() -> Target? {
+        if !lidClosed(), let builtIn {
+            let r = builtIn.read()
+            // Idle dimming switches the built-in light off a few seconds after the last input of any kind.
+            // Mirroring that would blink the Lofree off at every pause, so hold the last level instead.
+            if r.idleDimmed {
+                guard let followed else { return nil }
+                return Target(level: followed, key: "builtin:\(followed)", reason: "holding (MacBook backlight idle-dimmed)")
+            }
+            let level = BuiltInBacklight.level(for: r.brightness, current: followed)
+            followed = level
+            return Target(level: level, key: "builtin:\(level)",
+                          reason: String(format: "following MacBook backlight %.0f%%%@", r.brightness * 100, r.autoBrightness ? " (auto)" : ""))
+        }
+        followed = nil
+        do {
+            schedule = try Schedule.load()
+            scheduleError = nil
+        } catch {
+            scheduleError = "\(error)" // keep using the last schedule that loaded
+        }
+        guard let schedule else { return nil }
+        let (entry, since) = schedule.current()
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         f.dateFormat = "yyyy-MM-dd'T'HH:mm"
-        return "\(f.string(from: since)) level=\(entry.level)"
-    }
-    static func read() -> String? {
-        (try? String(contentsOf: url, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-    static func write(_ key: String) throws {
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try (key + "\n").write(to: url, atomically: true, encoding: .utf8)
+        return Target(level: entry.level, key: "schedule:\(f.string(from: since)):\(entry.level)",
+                      reason: "\(lidClosed() ? "lid closed" : "no built-in backlight"), schedule \(entry.time)")
     }
 }
 
-// MARK: - CLI
+// MARK: - Daemon
 
 func log(_ msg: String) {
     let f = ISO8601DateFormatter()
     f.formatOptions = [.withInternetDateTime]
     f.timeZone = .current
     print("\(f.string(from: Date())) \(msg)")
+    fflush(stdout)
 }
 
+func runDaemon() -> Never {
+    let controller = Controller()
+    log("started (\(controller.builtIn == nil ? "no built-in keyboard backlight found, schedule only" : "following MacBook backlight when the lid is open"))")
+    var appliedKey: String?, appliedLevel: Level?
+    var pending: Target?, pendingTicks = 0
+    var connected = false
+    var lastProblem: String?
+
+    while true {
+        autoreleasepool {
+            var problem: String?
+            defer {
+                if let problem, problem != lastProblem { log(problem) }
+                lastProblem = problem
+            }
+
+            let nowConnected = Keyboard.isConnected
+            if nowConnected != connected {
+                log(nowConnected ? "Lofree connected" : "Lofree disconnected")
+                connected = nowConnected
+                appliedKey = nil      // re-apply after a re-plug; the keyboard may have been changed elsewhere
+                appliedLevel = nil
+            }
+            let target = controller.target()
+            problem = controller.scheduleError
+
+            guard connected, let target, target.key != appliedKey else { pending = nil; return }
+            // Apply only once the target has held for two consecutive checks, so a slider drag is one write.
+            if target == pending { pendingTicks += 1 } else { pending = target; pendingTicks = 1 }
+            guard pendingTicks >= 2 else { return }
+
+            do {
+                guard let kb = try Keyboard.open() else { return }
+                try Backlight(kb: kb).apply(target.level, previous: appliedLevel)
+                appliedKey = target.key
+                appliedLevel = target.level
+                pending = nil
+                log("level \(target.level): \(target.reason)")
+            } catch {
+                problem = "\(error)"
+            }
+        }
+        Thread.sleep(forTimeInterval: 1)
+    }
+}
+
+// MARK: - CLI
+
 let usage = """
-usage: lofree-light set <off|0-4>     set the backlight now
-       lofree-light auto [--force]    apply the schedule if a new slot has started
-       lofree-light auto --dry-run    show which slot is in effect, change nothing
-schedule: \(Schedule.path.path)
+usage: lofree-light run               follow the MacBook backlight / schedule (what launchd runs)
+       lofree-light status            show what `run` would set the Lofree to right now
+       lofree-light set <off|0-4>     set the Lofree backlight once
+schedule (used when the lid is closed): \(Schedule.path.path)
 """
 
 func run(_ args: [String]) throws -> Int32 {
     switch args.first {
+    case "run":
+        runDaemon()
+    case "status":
+        let c = Controller()
+        print("lid:      \(lidClosed() ? "closed" : "open")")
+        if let b = c.builtIn {
+            let r = b.read()
+            print(String(format: "MacBook:  backlight %.0f%%%@%@", r.brightness * 100,
+                         r.autoBrightness ? ", auto-brightness on" : "", r.idleDimmed ? ", idle-dimmed right now" : ""))
+        } else {
+            print("MacBook:  no built-in keyboard backlight found")
+        }
+        print("Lofree:   \(Keyboard.isConnected ? "connected over USB" : "not connected over USB")")
+        if let t = c.target() {
+            print("target:   level \(t.level) (\(t.reason))")
+        } else {
+            print("target:   no change (MacBook backlight is idle-dimmed; type something and re-run)")
+        }
+        if let e = c.scheduleError { print("schedule: \(e)") }
     case "set":
         guard args.count == 2 else { print(usage); return 2 }
         let level = try Level(parsing: args[1])
         guard let kb = try Keyboard.open() else { throw LofreeError("no Lofree keyboard connected over USB") }
         try Backlight(kb: kb).apply(level)
         print("sent: \(level)")
-    case "auto":
-        let flags = Set(args.dropFirst())
-        guard flags.isSubset(of: ["--force", "--dry-run"]) else { print(usage); return 2 }
-        let (entry, since) = try Schedule.load().current()
-        let key = AppliedSlot.key(entry, since)
-        if flags.contains("--dry-run") {
-            print("in effect: \(entry.time) -> \(entry.level)  (slot \(key); last applied: \(AppliedSlot.read() ?? "never"))")
-            return 0
-        }
-        if !flags.contains("--force"), AppliedSlot.read() == key { return 0 }
-        guard let kb = try Keyboard.open() else { return 0 } // not plugged in; retry on next run
-        try Backlight(kb: kb).apply(entry.level)
-        try AppliedSlot.write(key)
-        log("slot \(entry.time): sent level \(entry.level)")
     default:
         print(usage)
         return args.first == "-h" || args.first == "--help" ? 0 : 2

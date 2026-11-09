@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Builds lofree-light, installs it to ~/.local/bin, and runs `lofree-light auto` every minute via launchd.
+# Builds lofree-light, installs it to ~/.local/bin, and keeps `lofree-light run` running via launchd.
 set -euo pipefail
 cd "${0:A:h}"
 
@@ -25,9 +25,9 @@ cat > "$PLIST" <<PLIST
 <dict>
   <key>Label</key><string>$LABEL</string>
   <key>ProgramArguments</key>
-  <array><string>$BIN</string><string>auto</string></array>
-  <key>StartInterval</key><integer>60</integer>
+  <array><string>$BIN</string><string>run</string></array>
   <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
   <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key><string>$LOG</string>
   <key>StandardErrorPath</key><string>$LOG</string>
