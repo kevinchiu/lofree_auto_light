@@ -1,74 +1,97 @@
 // lofree-light: set a Lofree keyboard's backlight brightness from a time-of-day schedule.
 //
 // Protocol (reverse-engineered from Lofree's own web configurator, https://www.lofree.tech/keyboard/):
-//   - Vendor HID collection, usage page 0xFF02 / usage 2, report ID 8, 16-byte in/out reports.
-//   - Request:  [cmd, 0, addrHi, addrLo, len|0x80, data0..data9, checksum]
-//     checksum = (0x55 - (sum(bytes 0..14) & 0xFF) - 8) & 0xFF
-//   - The device echoes [cmd, status, addrHi, addrLo, len|0x80, data...] on input report 8.
-//   - cmd 8 reads and cmd 7 writes the keyboard's settings memory:
+//   - The keyboard has a vendor HID collection (usage page 0xFF02) that takes 16-byte output reports with report ID 8:
+//       [cmd, 0, addrHi, addrLo, len|0x80, data0..data9, checksum]
+//       checksum = (0x55 - (sum(bytes 0..14) & 0xFF) - 8) & 0xFF
+//   - cmd 7 writes the keyboard's settings memory:
 //       0x2130 current light mode  [mode, 0x55-mode]
 //       0x2132 light on/off        [state, 0x55-state]
 //       0x2160 + mode*32           [colorIndex, speed, brightness(0-4), 0x55-sum]
+//
+// Transport: the report is sent as a plain USB HID SET_REPORT control transfer to the device, not through
+// macOS's HID stack. Opening the HID interface would require Input Monitoring permission, because the same
+// USB interface also carries keystrokes. A USB control transfer needs no permission, but it is write-only:
+// the keyboard's replies arrive on the interrupt endpoint owned by the HID driver, and the firmware answers
+// GET_REPORT with zeros. So this tool cannot read the keyboard's current settings; it only writes them.
 
 import Foundation
-import IOKit.hid
-
-// MARK: - HID transport
+import IOKit
+import IOUSBHost
 
 struct LofreeError: Error, CustomStringConvertible {
     let description: String
     init(_ d: String) { description = d }
 }
 
+// MARK: - USB transport
+
 final class Keyboard {
     static let reportID: UInt8 = 8
+    static let vendorUsagePage = 0xFF02
     static let lofreeVendorIDs: Set<Int> = [0x3554, 0x388D]
 
-    private let device: IOHIDDevice
-    private let inputBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 64)
-    private var lastReport: [UInt8]?
+    private let device: IOUSBHostDevice
+    private let interfaceNumber: UInt16
 
-    /// Finds the keyboard's vendor-config interface. Returns nil when no Lofree keyboard is attached.
+    /// Opens the first USB-attached Lofree keyboard. Returns nil when none is attached.
     static func open() throws -> Keyboard? {
-        let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
-        let matching = [kIOHIDDeviceUsagePageKey: 0xFF02, kIOHIDDeviceUsageKey: 2] as CFDictionary
-        IOHIDManagerSetDeviceMatching(manager, matching)
-        guard let set = IOHIDManagerCopyDevices(manager) as NSSet?,
-              let devices = set.allObjects as? [IOHIDDevice] else { return nil }
-
-        let match = devices.first { dev in
-            let product = IOHIDDeviceGetProperty(dev, kIOHIDProductKey as CFString) as? String ?? ""
-            let vid = IOHIDDeviceGetProperty(dev, kIOHIDVendorIDKey as CFString) as? Int ?? 0
-            return product.localizedCaseInsensitiveContains("lofree") || lofreeVendorIDs.contains(vid)
+        guard let (service, interfaceNumber) = findService() else { return nil }
+        do {
+            // Owning the USB device does not touch its HID interfaces, so typing keeps working.
+            let device = try IOUSBHostDevice(__ioService: service, options: [], queue: nil, interestHandler: nil)
+            return Keyboard(device: device, interfaceNumber: interfaceNumber)
+        } catch {
+            throw LofreeError("could not open the keyboard's USB device (\(error.localizedDescription))")
         }
-        guard let device = match else { return nil }
-
-        // kIOHIDOptionsTypeNone = shared access; never seize the interface, it also carries keystrokes.
-        let rc = IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeNone))
-        guard rc == kIOReturnSuccess else {
-            throw LofreeError(String(format: "could not open keyboard HID interface (IOReturn 0x%08x)%@", rc,
-                                     rc == kIOReturnNotPermitted ? " — grant Input Monitoring permission" : ""))
-        }
-        return Keyboard(device)
     }
 
-    private init(_ device: IOHIDDevice) {
+    private init(device: IOUSBHostDevice, interfaceNumber: UInt16) {
         self.device = device
-        let context = Unmanaged.passUnretained(self).toOpaque()
-        IOHIDDeviceRegisterInputReportCallback(device, inputBuffer, 64, { ctx, _, _, _, reportID, report, length in
-            guard let ctx, reportID == UInt32(Keyboard.reportID) else { return }
-            let kb = Unmanaged<Keyboard>.fromOpaque(ctx).takeUnretainedValue()
-            var bytes = Array(UnsafeBufferPointer(start: report, count: length))
-            if bytes.count == 17, bytes[0] == Keyboard.reportID { bytes.removeFirst() } // strip report ID
-            kb.lastReport = bytes
-        }, context)
-        IOHIDDeviceScheduleWithRunLoop(device, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
+        self.interfaceNumber = interfaceNumber
     }
 
-    deinit {
-        IOHIDDeviceUnscheduleFromRunLoop(device, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
-        IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
-        inputBuffer.deallocate()
+    deinit { device.destroy() }
+
+    private static func property(_ entry: io_registry_entry_t, _ key: String) -> Any? {
+        IORegistryEntryCreateCFProperty(entry, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue()
+    }
+
+    /// Finds a Lofree USB device and the number of its interface that carries the vendor collection.
+    private static func findService() -> (io_service_t, UInt16)? {
+        var devices: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOUSBHostDevice"), &devices) == KERN_SUCCESS
+        else { return nil }
+        defer { IOObjectRelease(devices) }
+
+        while case let dev = IOIteratorNext(devices), dev != 0 {
+            let name = property(dev, "USB Product Name") as? String ?? ""
+            let vid = property(dev, "idVendor") as? Int ?? 0
+            if name.localizedCaseInsensitiveContains("lofree") || lofreeVendorIDs.contains(vid),
+               let iface = vendorInterface(of: dev) {
+                return (dev, iface)
+            }
+            IOObjectRelease(dev)
+        }
+        return nil
+    }
+
+    private static func vendorInterface(of dev: io_service_t) -> UInt16? {
+        var children: io_iterator_t = 0
+        guard IORegistryEntryGetChildIterator(dev, kIOServicePlane, &children) == KERN_SUCCESS else { return nil }
+        defer { IOObjectRelease(children) }
+
+        while case let child = IOIteratorNext(children), child != 0 {
+            defer { IOObjectRelease(child) }
+            guard let number = property(child, "bInterfaceNumber") as? Int else { continue }
+            let pairs = IORegistryEntrySearchCFProperty(child, kIOServicePlane, "DeviceUsagePairs" as CFString,
+                                                        kCFAllocatorDefault, IOOptionBits(kIORegistryIterateRecursively))
+            if let pairs = pairs as? [[String: Any]],
+               pairs.contains(where: { $0["DeviceUsagePage"] as? Int == vendorUsagePage }) {
+                return UInt16(number)
+            }
+        }
+        return nil
     }
 
     private static func checksum(_ p: [UInt8]) -> UInt8 {
@@ -76,48 +99,34 @@ final class Keyboard {
         return UInt8(truncatingIfNeeded: 0x55 - sum - 8)
     }
 
-    /// Sends one 16-byte command and waits for the device's echo.
-    private func transfer(_ cmd: UInt8, addr: Int, data: [UInt8] = [], length: Int? = nil) throws -> [UInt8] {
+    /// Writes `data` (at most 10 bytes) to the keyboard's settings memory at `addr`.
+    func write(_ addr: Int, _ data: [UInt8]) throws {
         precondition(data.count <= 10)
         var p = [UInt8](repeating: 0, count: 16)
-        p[0] = cmd
+        p[0] = 7 // WriteFlashData
         p[2] = UInt8((addr >> 8) & 0xFF)
         p[3] = UInt8(addr & 0xFF)
-        p[4] = UInt8((length ?? data.count) | 0x80)
+        p[4] = UInt8(data.count | 0x80)
         for (i, b) in data.enumerated() { p[5 + i] = b }
         p[15] = Keyboard.checksum(p)
 
-        let out = [Keyboard.reportID] + p
-        for _ in 0..<3 {
-            lastReport = nil
-            let rc = out.withUnsafeBufferPointer {
-                IOHIDDeviceSetReport(device, kIOHIDReportTypeOutput, CFIndex(Keyboard.reportID), $0.baseAddress!, $0.count)
-            }
-            guard rc == kIOReturnSuccess else {
-                throw LofreeError(String(format: "sending to keyboard failed (IOReturn 0x%08x)", rc))
-            }
-            let deadline = Date().addingTimeInterval(1.0)
-            while Date() < deadline {
-                CFRunLoopRunInMode(.defaultMode, 0.02, true)
-                if let r = lastReport, r.count >= 16, r[0] == cmd, r[2] == p[2], r[3] == p[3],
-                   r[15] == Keyboard.checksum(r) {
-                    return r
-                }
-            }
-        }
-        throw LofreeError("keyboard did not answer command \(cmd) @0x\(String(addr, radix: 16))")
-    }
+        let report = [Keyboard.reportID] + p
+        var request = IOUSBDeviceRequest()
+        request.bmRequestType = 0x21                      // host-to-device, class, interface
+        request.bRequest = 0x09                           // HID SET_REPORT
+        request.wValue = 0x0200 | UInt16(Keyboard.reportID) // output report, ID 8
+        request.wIndex = interfaceNumber
+        request.wLength = UInt16(report.count)
 
-    func read(_ addr: Int, count: Int) throws -> [UInt8] {
-        let r = try transfer(8, addr: addr, length: count)
-        return Array(r[5..<(5 + count)])
-    }
-
-    func write(_ addr: Int, _ data: [UInt8]) throws {
-        _ = try transfer(7, addr: addr, data: data)
-        guard try read(addr, count: data.count) == data else {
-            throw LofreeError("write to 0x\(String(addr, radix: 16)) did not stick")
+        var sent = 0
+        do {
+            try device.__send(request, data: NSMutableData(bytes: report, length: report.count),
+                              bytesTransferred: &sent, completionTimeout: 1.0)
+        } catch {
+            throw LofreeError("sending to keyboard failed (\(error.localizedDescription))")
         }
+        guard sent == report.count else { throw LofreeError("keyboard accepted \(sent) of \(report.count) bytes") }
+        usleep(20_000) // the web configurator waits for each reply; we can't see replies, so pace the writes instead
     }
 }
 
@@ -152,41 +161,24 @@ enum Level: Equatable, CustomStringConvertible, Decodable {
 struct Backlight {
     static let modeAddr = 0x2130, stateAddr = 0x2132, effectBase = 0x2160
 
+    // Brightness is stored per light mode, and the current mode can't be read back over this transport,
+    // so the schedule pins the keyboard to one mode. These are the values this keyboard was set to
+    // (mode 0, color index 0, speed 2).
+    static let mode = 0, colorIndex: UInt8 = 0, speed: UInt8 = 2
+
     let kb: Keyboard
 
-    struct Status { var mode: Int; var on: Bool; var brightness: Int; var effect: [UInt8] }
-
-    func status() throws -> Status {
-        let ms = try kb.read(Backlight.modeAddr, count: 4)  // [mode, ~mode, state, ~state]
-        let mode = Int(ms[0])
-        guard mode < 16 else { throw LofreeError("unexpected light mode \(mode)") }
-        let effect = try kb.read(Backlight.effectBase + mode * 32, count: 4)
-        return Status(mode: mode, on: ms[2] == 1, brightness: Int(effect[2]), effect: effect)
-    }
-
-    /// Applies `level`, writing only what differs. Returns a short description of what changed.
-    @discardableResult
-    func apply(_ level: Level) throws -> String {
-        let s = try status()
+    func apply(_ level: Level) throws {
         switch level {
         case .off:
-            guard s.on else { return "already off" }
             try kb.write(Backlight.stateAddr, [0, 0x55])
-            return "turned off"
         case .brightness(let n):
-            var changes: [String] = []
-            if !s.on {
-                try kb.write(Backlight.stateAddr, [1, 0x54])
-                changes.append("turned on")
-            }
-            if s.brightness != n {
-                var e = Array(s.effect[0..<3])
-                e[2] = UInt8(n)
-                e.append(UInt8(truncatingIfNeeded: 0x55 - e.reduce(0) { $0 + Int($1) }))
-                try kb.write(Backlight.effectBase + s.mode * 32, e)
-                changes.append("brightness \(s.brightness) -> \(n)")
-            }
-            return changes.isEmpty ? "already at \(n)" : changes.joined(separator: ", ")
+            let m = UInt8(Backlight.mode)
+            var effect = [Backlight.colorIndex, Backlight.speed, UInt8(n)]
+            effect.append(UInt8(truncatingIfNeeded: 0x55 - effect.reduce(0) { $0 + Int($1) }))
+            try kb.write(Backlight.modeAddr, [m, 0x55 &- m])
+            try kb.write(Backlight.effectBase + Backlight.mode * 32, effect)
+            try kb.write(Backlight.stateAddr, [1, 0x54])
         }
     }
 }
@@ -269,14 +261,8 @@ func log(_ msg: String) {
     print("\(f.string(from: Date())) \(msg)")
 }
 
-func requireKeyboard() throws -> Backlight {
-    guard let kb = try Keyboard.open() else { throw LofreeError("no Lofree keyboard found") }
-    return Backlight(kb: kb)
-}
-
 let usage = """
-usage: lofree-light status            show current backlight mode/state/brightness
-       lofree-light set <off|0-4>     set the backlight now
+usage: lofree-light set <off|0-4>     set the backlight now
        lofree-light auto [--force]    apply the schedule if a new slot has started
        lofree-light auto --dry-run    show which slot is in effect, change nothing
 schedule: \(Schedule.path.path)
@@ -284,13 +270,12 @@ schedule: \(Schedule.path.path)
 
 func run(_ args: [String]) throws -> Int32 {
     switch args.first {
-    case "status":
-        let s = try requireKeyboard().status()
-        print("light: \(s.on ? "on" : "off"), mode: \(s.mode), brightness: \(s.brightness) (range \(Level.range.lowerBound)-\(Level.range.upperBound))")
     case "set":
         guard args.count == 2 else { print(usage); return 2 }
         let level = try Level(parsing: args[1])
-        print(try requireKeyboard().apply(level))
+        guard let kb = try Keyboard.open() else { throw LofreeError("no Lofree keyboard connected over USB") }
+        try Backlight(kb: kb).apply(level)
+        print("sent: \(level)")
     case "auto":
         let flags = Set(args.dropFirst())
         guard flags.isSubset(of: ["--force", "--dry-run"]) else { print(usage); return 2 }
@@ -302,12 +287,12 @@ func run(_ args: [String]) throws -> Int32 {
         }
         if !flags.contains("--force"), AppliedSlot.read() == key { return 0 }
         guard let kb = try Keyboard.open() else { return 0 } // not plugged in; retry on next run
-        let result = try Backlight(kb: kb).apply(entry.level)
+        try Backlight(kb: kb).apply(entry.level)
         try AppliedSlot.write(key)
-        log("slot \(entry.time) level \(entry.level): \(result)")
+        log("slot \(entry.time): sent level \(entry.level)")
     default:
         print(usage)
-        return args.isEmpty ? 2 : (args.first == "-h" || args.first == "--help" ? 0 : 2)
+        return args.first == "-h" || args.first == "--help" ? 0 : 2
     }
     return 0
 }
