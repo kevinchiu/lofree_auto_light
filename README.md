@@ -1,7 +1,8 @@
 # lofree-light
 
-Makes a Lofree keyboard's backlight follow the MacBook's built-in keyboard backlight while the lid
-is open. When the lid is closed, it uses a time-of-day schedule instead.
+Switches a Lofree keyboard's backlight on and off with the MacBook's built-in keyboard backlight
+while the lid is open. When the lid is closed, it uses a time-of-day schedule instead. Brightness
+and lighting effect are yours to set with the keyboard's Fn keys; the tool never changes them.
 Tested with the Flow Lite84 (`Air84@Lofree`, USB ID `05ac:024f`, firmware v1.64) over USB, on a
 MacBook Pro (M1 Max).
 
@@ -25,54 +26,61 @@ No macOS permissions are needed (see [Transport](#transport)).
 ## Lid open: follow the MacBook
 
 `run` checks the built-in keyboard backlight once a second. That's the Keyboard Brightness slider,
-whether you set it yourself or auto-brightness did. The slider maps onto the Lofree in five equal bands:
+whether you set it yourself or auto-brightness did. While the MacBook's backlight is on, the Lofree's
+is on; when the slider is at 0, or auto-brightness has turned it off, the Lofree's is off.
 
-| MacBook slider | Lofree |
-|---|---|
-| 0% | off |
-| 1–19% | 0 |
-| 20–39% | 1 |
-| 40–59% | 2 |
-| 60–79% | 3 |
-| 80–100% | 4 |
-
-- **Bouncing at band edges:** a small margin keeps auto-brightness from flipping the Lofree back
-  and forth when the slider sits near a band edge.
-- **Slider drags:** a new level is written only after it has held for two checks, so dragging the
-  slider produces one write.
+- **Near zero:** after switching off, the Lofree comes back on only once the slider is above 2%, so
+  auto-brightness hovering just above zero doesn't flip it back and forth.
+- **Slider drags:** a change is written only after it has held for 10 seconds, so dragging the
+  slider through zero costs nothing.
 - **Idle dimming is ignored:** macOS switches the built-in light off a few seconds after the last
   input from any keyboard or mouse. Mirroring that would blink the Lofree off at every pause, so
-  the Lofree keeps its last level instead. It has its own idle timeout.
+  the Lofree stays as it was. It has its own idle timeout.
 
 ## Lid closed: schedule
 
-`~/.config/lofree-light/schedule.json`. Levels are `"off"` or `0`–`4`. Times are 24-hour local time.
+`~/.config/lofree-light/schedule.json`. Each `level` is `"on"` or `"off"` (numbers 0–4 from older
+schedules count as `"on"`). Times are 24-hour local time.
 Each entry holds until the next one, wrapping around midnight. Edits are picked up within a second.
 
 ```json
 {
   "schedule": [
     { "time": "07:00", "level": "off" },
-    { "time": "17:00", "level": 4 }
+    { "time": "17:00", "level": "on" }
   ]
 }
 ```
 
-A level is written when the lid closes and when a new slot starts.
+## Saving writes
 
-Brightness changes you make with the Fn keys are left alone until the next change of source: a new
-level from the MacBook, the lid opening or closing, or a new schedule slot. Unplugging and
-replugging the keyboard re-applies the current level.
+Switching the light on or off is one write to the keyboard's settings memory, which is flash memory
+and wears out after a limited number of writes. Lofree doesn't publish how many writes its chip is
+rated for, so the tool writes as little as it can:
+
+- **Only when the state should change.** A write happens when the tool wants the light the other
+  way from how it last set it. Restarting, replugging the keyboard, or opening or closing the lid
+  when the MacBook and the schedule agree costs nothing. With the default schedule, that's 2
+  writes a day.
+- **A daily limit of 10 writes.** Once it's used up, the tool leaves the light as it is until
+  midnight and says so in the log. `lofree-light set` isn't held to the limit, but its writes count
+  toward it.
+
+If you switch the light with the Fn keys, it stays that way until the tool next wants to switch it.
+
+The write count is kept in `~/.local/state/lofree-light/writes.json`, along with what the tool last
+wrote. `lofree-light status` shows it.
 
 ## Commands
 
 ```sh
-lofree-light status   # lid state, MacBook backlight, and the level `run` would set
-lofree-light set 3    # set the Lofree once (or: set off)
+lofree-light status   # lid state, MacBook backlight, what `run` wants, and writes used
+lofree-light set on   # switch the Lofree's light once (or: set off)
 lofree-light run      # the loop launchd runs
 ```
 
-Log: `~/Library/Logs/lofree-light.log`. It records level changes, connects, disconnects and errors.
+Log: `~/Library/Logs/lofree-light.log`. It records each switch on or off, connects, disconnects,
+the daily limit being reached, and errors.
 
 ## Protocol
 
@@ -80,8 +88,8 @@ Taken from Lofree's web configurator (https://www.lofree.tech/keyboard/). The ke
 vendor HID collection on usage page `0xFF02`, which uses 16-byte reports with report ID 8.
 Requests have the form `[cmd, 0, addrHi, addrLo, len|0x80, data…, checksum]`.
 Command 8 reads the keyboard's settings memory and command 7 writes it. The backlight
-on/off flag is at `0x2132` and the current effect mode is at `0x2130`. Each mode has its own
-brightness, at `0x2160 + mode*32 + 2`. See the header of `Sources/main.swift` for details.
+on/off flag is at `0x2132`, and it's the only thing this tool writes. See the header of
+`Sources/main.swift` for the other fields.
 
 The MacBook's backlight is read through `KeyboardBrightnessClient`, from the private CoreBrightness
 framework. If a macOS update removes or changes it, `run` falls back to the schedule full time.
@@ -94,11 +102,8 @@ so opening it through the HID system would need Input Monitoring permission. A c
 transfer doesn't.
 
 The catch is that this channel is write-only. The keyboard's replies go to the HID driver,
-and the firmware returns zeros for `GET_REPORT`. So the tool can't read the current settings.
-Because brightness is stored per light mode and the active mode can't be read, turning the
-light on also sets the keyboard to mode 0, with color index 0 and speed 2 (the values
-this keyboard came with). If you pick a different lighting effect with the Fn keys, the next
-level change switches it back.
+and the firmware returns zeros for `GET_REPORT`. So the tool can't read the current settings,
+including whether you've switched the light with the Fn keys.
 
 Over Bluetooth or the 2.4 GHz dongle the tool does nothing. Only a USB connection is supported.
 

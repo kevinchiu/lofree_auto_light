@@ -1,14 +1,18 @@
-// lofree-light: drive a Lofree keyboard's backlight from the MacBook's built-in keyboard backlight
-// (lid open) or from a time-of-day schedule (lid closed).
+// lofree-light: switch a Lofree keyboard's backlight on and off with the MacBook's built-in keyboard backlight
+// (lid open) or a time-of-day schedule (lid closed). Brightness and effect are left to the keyboard's Fn keys.
 //
 // Protocol (reverse-engineered from Lofree's own web configurator, https://www.lofree.tech/keyboard/):
 //   - The keyboard has a vendor HID collection (usage page 0xFF02) that takes 16-byte output reports with report ID 8:
 //       [cmd, 0, addrHi, addrLo, len|0x80, data0..data9, checksum]
 //       checksum = (0x55 - (sum(bytes 0..14) & 0xFF) - 8) & 0xFF
-//   - cmd 7 writes the keyboard's settings memory:
+//   - cmd 7 writes the keyboard's settings memory (Lofree's configurator calls it WriteFlashData):
 //       0x2130 current light mode  [mode, 0x55-mode]
-//       0x2132 light on/off        [state, 0x55-state]
+//       0x2132 light on/off        [state, 0x55-state]     <- the only field this tool writes
+//       0x2134 idle-off timer      [10 s units, 0x55-value]
 //       0x2160 + mode*32           [colorIndex, speed, brightness(0-4), 0x55-sum]
+//
+// Flash wear: every write goes to the keyboard's settings flash, and the chip's endurance isn't published. So
+// the tool writes only when it wants the light switched, and stops at a daily limit.
 //
 // Transport: the report is sent as a plain USB HID SET_REPORT control transfer to the device, not through
 // macOS's HID stack. Opening the HID interface would require Input Monitoring permission, because the same
@@ -148,62 +152,92 @@ final class Keyboard {
 
 // MARK: - Lofree backlight
 
-enum Level: Equatable, CustomStringConvertible, Decodable {
-    case off
-    case brightness(Int)
-    static let range = 0...4
+/// The tool only switches the Lofree's backlight on or off. Brightness and effect are whatever was last chosen
+/// with the keyboard's Fn keys; the keyboard keeps them while the light is off.
+enum Light: String, CustomStringConvertible, Codable {
+    case on, off
 
     init(parsing s: String) throws {
-        if s.lowercased() == "off" { self = .off; return }
-        guard let n = Int(s), Level.range.contains(n) else {
-            throw LofreeError("level must be off or \(Level.range.lowerBound)-\(Level.range.upperBound), got \"\(s)\"")
-        }
-        self = .brightness(n)
+        guard let light = Light(rawValue: s.lowercased()) else { throw LofreeError("expected on or off, got \"\(s)\"") }
+        self = light
     }
 
+    // Schedules from earlier versions used brightness levels 0-4; read any of them as on.
     init(from decoder: Decoder) throws {
         let c = try decoder.singleValueContainer()
-        if let n = try? c.decode(Int.self) { try self.init(parsing: String(n)) } else { try self.init(parsing: c.decode(String.self)) }
+        if let n = try? c.decode(Int.self), (0...4).contains(n) { self = .on } else { try self.init(parsing: c.decode(String.self)) }
     }
 
-    var description: String {
-        switch self {
-        case .off: return "off"
-        case .brightness(let n): return "\(n)"
-        }
-    }
+    var description: String { rawValue }
 }
 
 struct Backlight {
-    static let modeAddr = 0x2130, stateAddr = 0x2132, effectBase = 0x2160
-
-    // Brightness is stored per light mode, and the current mode can't be read back over this transport,
-    // so brightness changes pin the keyboard to one mode. These are the values this keyboard was set to
-    // (mode 0, color index 0, speed 2).
-    static let mode = 0, colorIndex: UInt8 = 0, speed: UInt8 = 2
+    static let stateAddr = 0x2132
 
     let kb: Keyboard
 
-    /// Writes `level`. `previous` is what this process last wrote, if anything; it lets brightness-only
-    /// changes skip the mode and on/off writes, to keep wear on the keyboard's flash down.
-    func apply(_ level: Level, previous: Level? = nil) throws {
-        switch level {
-        case .off:
-            try kb.write(Backlight.stateAddr, [0, 0x55])
-        case .brightness(let n):
-            var wasOn = false
-            if case .brightness? = previous { wasOn = true }
-            if !wasOn {
-                let m = UInt8(Backlight.mode)
-                try kb.write(Backlight.modeAddr, [m, 0x55 &- m])
-            }
-            var effect = [Backlight.colorIndex, Backlight.speed, UInt8(n)]
-            effect.append(UInt8(truncatingIfNeeded: 0x55 - effect.reduce(0) { $0 + Int($1) }))
-            try kb.write(Backlight.effectBase + Backlight.mode * 32, effect)
-            if !wasOn {
-                try kb.write(Backlight.stateAddr, [1, 0x54])
-            }
+    /// Whether switching to `light` takes a write: not when `record` says it's already that way, unless `force`.
+    static func needsWrite(_ light: Light, record: WriteRecord, force: Bool = false) -> Bool {
+        force || record.written != light
+    }
+
+    /// Switches the light (one write), counting it in `record`.
+    func apply(_ light: Light, record: inout WriteRecord, force: Bool = false) throws {
+        guard Backlight.needsWrite(light, record: record, force: force) else { return }
+        try kb.write(Backlight.stateAddr, light == .on ? [1, 0x54] : [0, 0x55])
+        record.countWrite()
+        record.written = light
+    }
+}
+
+// MARK: - Write record
+
+/// What lofree-light has written to the keyboard, shared by `run` and `set`. The keyboard can't be read back over
+/// this transport, so this record is what lets `run` skip writes that wouldn't change anything and stay under a
+/// daily limit. Changes made with the keyboard's Fn keys don't show up in it.
+struct WriteRecord: Codable {
+    var written: Light?     // what `run` or `set` last wrote; nil = unknown
+    var applied: Light?     // what `run` last applied
+    var day = ""            // the local date that `today` counts writes for
+    var today = 0
+    var total = 0
+    var since = ""          // the date counting started
+
+    static let dailyLimit = 10
+
+    static var path: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/state/lofree-light/writes.json")
+    }
+
+    static func load() -> WriteRecord {
+        guard let data = try? Data(contentsOf: path),
+              let record = try? JSONDecoder().decode(WriteRecord.self, from: data) else {
+            return WriteRecord(since: dayString(Date()))
         }
+        return record
+    }
+
+    func save() throws {
+        try FileManager.default.createDirectory(at: WriteRecord.path.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(self).write(to: WriteRecord.path, options: .atomic)
+    }
+
+    static func dayString(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        return f.string(from: date)
+    }
+
+    func writesToday(_ now: Date = Date()) -> Int { day == WriteRecord.dayString(now) ? today : 0 }
+
+    mutating func countWrite(_ now: Date = Date()) {
+        let d = WriteRecord.dayString(now)
+        if day != d { day = d; today = 0 }
+        today += 1
+        total += 1
     }
 }
 
@@ -251,13 +285,11 @@ final class BuiltInBacklight {
                        autoBrightness: c.isAutoBrightnessEnabled(forKeyboard: keyboardID))
     }
 
-    /// Maps the 0-1 slider onto off + Lofree levels 0-4 (five equal bands). Sticks with `current` until the
-    /// value is clearly past that band's edge, so auto-brightness jitter at a boundary doesn't cause flapping.
-    static func level(for brightness: Float, current: Level?) -> Level {
-        guard brightness > 0.001 else { return .off }
-        let x = Double(brightness) * 5
-        if case .brightness(let c)? = current, x > Double(c) - 0.15, x < Double(c + 1) + 0.15 { return .brightness(c) }
-        return .brightness(min(Level.range.upperBound, Int(x)))
+    /// On while the built-in backlight is on (slider above 0). Coming back on from off takes more than 2%, so
+    /// auto-brightness hovering just above zero doesn't switch the Lofree back and forth.
+    static func light(for brightness: Float, current: Light?) -> Light {
+        if brightness <= 0.001 || (current == .off && brightness < 0.02) { return .off }
+        return .on
     }
 }
 
@@ -272,7 +304,7 @@ func lidClosed() -> Bool {
 struct Schedule: Decodable {
     struct Entry: Decodable {
         let time: String
-        let level: Level
+        let level: Light
     }
     let entries: [Entry]
 
@@ -318,15 +350,14 @@ struct Schedule: Decodable {
 
 // MARK: - Deciding what the Lofree should show
 
-struct Target: Equatable {
-    var level: Level
-    var key: String     // a new key means "apply now"; an unchanged key leaves manual Fn-key changes alone
+struct Target {
+    var light: Light
     var reason: String
 }
 
 final class Controller {
     let builtIn = BuiltInBacklight()
-    private var followed: Level?
+    private var followed: Light?
     private var schedule: Schedule?
     private(set) var scheduleError: String?
 
@@ -335,14 +366,14 @@ final class Controller {
         if !lidClosed(), let builtIn {
             let r = builtIn.read()
             // Idle dimming switches the built-in light off a few seconds after the last input of any kind.
-            // Mirroring that would blink the Lofree off at every pause, so hold the last level instead.
+            // Mirroring that would blink the Lofree off at every pause, so hold the last state instead.
             if r.idleDimmed {
                 guard let followed else { return nil }
-                return Target(level: followed, key: "builtin:\(followed)", reason: "holding (MacBook backlight idle-dimmed)")
+                return Target(light: followed, reason: "holding (MacBook backlight idle-dimmed)")
             }
-            let level = BuiltInBacklight.level(for: r.brightness, current: followed)
-            followed = level
-            return Target(level: level, key: "builtin:\(level)",
+            let light = BuiltInBacklight.light(for: r.brightness, current: followed)
+            followed = light
+            return Target(light: light,
                           reason: String(format: "following MacBook backlight %.0f%%%@", r.brightness * 100, r.autoBrightness ? " (auto)" : ""))
         }
         followed = nil
@@ -353,12 +384,8 @@ final class Controller {
             scheduleError = "\(error)" // keep using the last schedule that loaded
         }
         guard let schedule else { return nil }
-        let (entry, since) = schedule.current()
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = "yyyy-MM-dd'T'HH:mm"
-        return Target(level: entry.level, key: "schedule:\(f.string(from: since)):\(entry.level)",
-                      reason: "\(lidClosed() ? "lid closed" : "no built-in backlight"), schedule \(entry.time)")
+        let entry = schedule.current().entry
+        return Target(light: entry.level, reason: "\(lidClosed() ? "lid closed" : "no built-in backlight"), schedule \(entry.time)")
     }
 }
 
@@ -372,11 +399,16 @@ func log(_ msg: String) {
     fflush(stdout)
 }
 
+/// A change is applied only after it has held for this many one-second checks, so dragging the slider through
+/// zero, or auto-brightness briefly dipping to off, costs no writes.
+let settleChecks = 10
+
 func runDaemon() -> Never {
     let controller = Controller()
-    log("started (\(controller.builtIn == nil ? "no built-in keyboard backlight found, schedule only" : "following MacBook backlight when the lid is open"))")
-    var appliedKey: String?, appliedLevel: Level?
-    var pending: Target?, pendingTicks = 0
+    var record = WriteRecord.load()
+    log("started (\(controller.builtIn == nil ? "no built-in keyboard backlight found, schedule only" : "following MacBook backlight when the lid is open")); "
+        + "\(record.writesToday()) of \(WriteRecord.dailyLimit) writes used today")
+    var pending: Light?, pendingTicks = 0
     var connected = false
     var lastProblem: String?
 
@@ -392,27 +424,35 @@ func runDaemon() -> Never {
             if nowConnected != connected {
                 log(nowConnected ? "Lofree connected" : "Lofree disconnected")
                 connected = nowConnected
-                appliedKey = nil      // re-apply after a re-plug; the keyboard may have been changed elsewhere
-                appliedLevel = nil
             }
             let target = controller.target()
             problem = controller.scheduleError
 
-            guard connected, let target, target.key != appliedKey else { pending = nil; return }
-            // Apply only once the target has held for two consecutive checks, so a slider drag is one write.
-            if target == pending { pendingTicks += 1 } else { pending = target; pendingTicks = 1 }
-            guard pendingTicks >= 2 else { return }
+            // Write only when the wanted state differs from the last one applied. Restarts, replugs, and switching
+            // between the MacBook and the schedule cost nothing when they agree, and Fn-key changes stay until then.
+            guard connected, let target, target.light != record.applied else { pending = nil; return }
+            if target.light == pending { pendingTicks += 1 } else { pending = target.light; pendingTicks = 1 }
+            guard pendingTicks >= settleChecks else { return }
 
+            record = WriteRecord.load() // pick up writes made by `set`
+            let needed = Backlight.needsWrite(target.light, record: record)
+            if needed, record.writesToday() >= WriteRecord.dailyLimit {
+                problem = "daily limit of \(WriteRecord.dailyLimit) writes reached; holding until tomorrow instead of switching the light \(target.light)"
+                return
+            }
             do {
-                guard let kb = try Keyboard.open() else { return }
-                try Backlight(kb: kb).apply(target.level, previous: appliedLevel)
-                appliedKey = target.key
-                appliedLevel = target.level
-                pending = nil
-                log("level \(target.level): \(target.reason)")
+                if needed {
+                    guard let kb = try Keyboard.open() else { return }
+                    try Backlight(kb: kb).apply(target.light, record: &record)
+                }
+                record.applied = target.light
+                log("light \(target.light): \(target.reason) "
+                    + (needed ? "(1 write, \(record.writesToday()) today)" : "(already \(target.light), no write)"))
             } catch {
                 problem = "\(error)"
             }
+            pending = nil // after a failure, wait another settle period before retrying
+            do { try record.save() } catch { problem = "cannot save \(WriteRecord.path.path) (\(error.localizedDescription))" }
         }
         Thread.sleep(forTimeInterval: 1)
     }
@@ -422,8 +462,8 @@ func runDaemon() -> Never {
 
 let usage = """
 usage: lofree-light run               follow the MacBook backlight / schedule (what launchd runs)
-       lofree-light status            show what `run` would set the Lofree to right now
-       lofree-light set <off|0-4>     set the Lofree backlight once
+       lofree-light status            show what `run` wants the Lofree's light to be right now
+       lofree-light set <on|off>      switch the Lofree's light once
 schedule (used when the lid is closed): \(Schedule.path.path)
 """
 
@@ -442,18 +482,27 @@ func run(_ args: [String]) throws -> Int32 {
             print("MacBook:  no built-in keyboard backlight found")
         }
         print("Lofree:   \(Keyboard.isConnected ? "connected over USB" : "not connected over USB")")
+        let record = WriteRecord.load()
         if let t = c.target() {
-            print("target:   level \(t.level) (\(t.reason))")
+            let state = t.light == record.applied ? "already applied"
+                : Backlight.needsWrite(t.light, record: record) ? "1 write to apply" : "already \(t.light), no write needed"
+            print("target:   \(t.light) (\(t.reason)), \(state)")
+        } else if c.scheduleError != nil {
+            print("target:   none (the schedule didn't load)")
         } else {
             print("target:   no change (MacBook backlight is idle-dimmed; type something and re-run)")
         }
         if let e = c.scheduleError { print("schedule: \(e)") }
+        print("writes:   \(record.writesToday()) today (limit \(WriteRecord.dailyLimit)), \(record.total) since \(record.since)")
     case "set":
         guard args.count == 2 else { print(usage); return 2 }
-        let level = try Level(parsing: args[1])
+        let light = try Light(parsing: args[1])
         guard let kb = try Keyboard.open() else { throw LofreeError("no Lofree keyboard connected over USB") }
-        try Backlight(kb: kb).apply(level)
-        print("sent: \(level)")
+        var record = WriteRecord.load()
+        // Not held to the daily limit, and doesn't trust the record: you may be correcting an Fn-key change.
+        defer { try? record.save() }
+        try Backlight(kb: kb).apply(light, record: &record, force: true)
+        print("sent: \(light) (1 write, \(record.writesToday()) today)")
     default:
         print(usage)
         return args.first == "-h" || args.first == "--help" ? 0 : 2
